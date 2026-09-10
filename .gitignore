@@ -1,0 +1,12 @@
+node_modules/
+dist/
+test-results/
+playwright-report/
+*.db*
+.venv/
+__pycache__/
+**/__pycache__/
+.nix-artifacts/
+release/
+verification/
+.nix-models/

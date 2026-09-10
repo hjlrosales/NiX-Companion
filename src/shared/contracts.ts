@@ -1,0 +1,52 @@
+import { z } from 'zod';
+import type { RunInput, AgentState, AuditEvent } from './agent';
+import type { IntegrationConfig } from './integrations';
+export const idSchema = z.string().uuid();
+export const sendSchema = z.object({ conversationId: idSchema, content: z.string().trim().min(1).max(6000), model: z.string().min(1).max(200) }).strict();
+export type SendInput = z.infer<typeof sendSchema>;
+export type Message = { id: string; conversationId: string; role: 'user' | 'assistant'; content: string; status: 'complete' | 'streaming' | 'error' | 'cancelled' | 'interrupted'; error: string | null; model: string; createdAt: number };
+export type Conversation = { id: string; title: string; updatedAt: number };
+export type Snapshot = { conversations: Conversation[]; selectedModel: string; active: string | null };
+export type ChatEvent = { conversationId: string; message: Message };
+export type SetupStatus = {
+  ollama: { ok: boolean; detail: string; models: string[] };
+  python: { ok: boolean; detail: string };
+  office: { ok: boolean; detail: string };
+  docker: { ok: boolean; detail: string };
+  edge: { ok: boolean; detail: string };
+  voice: { ready: boolean; busy: boolean };
+};
+export interface Bridge {
+  setupStatus(): Promise<SetupStatus>;
+  pullModel(model: string): Promise<string[]>;
+  voiceStatus(): Promise<{ready:boolean;busy:boolean}>;
+  setupVoice(): Promise<{ready:boolean;busy:boolean}>;
+  allowMicrophone(): Promise<void>;
+  transcribe(bytes: Uint8Array): Promise<string>;
+  speak(text:string):Promise<string>;
+  cancelVoice():Promise<void>;
+  integrations(): Promise<IntegrationConfig>;
+  saveIntegrations(config: IntegrationConfig): Promise<void>;
+  agentState(): Promise<AgentState>;
+  runEvents(id: string): Promise<AuditEvent[]>;
+  startRun(input: RunInput): Promise<string>;
+  resumeRun(id: string): Promise<string>;
+  cancelRun(id: string): Promise<void>;
+  approve(input: { id: string; allow: boolean; remember: boolean }): Promise<void>;
+  acceptRun(id: string): Promise<void>;
+  pickWorkspace(): Promise<string | null>;
+  workspace(): Promise<string>;
+  onAgent(listener: () => void): () => void;
+  openArtifact(input: { runId: string; path: string }): Promise<void>;
+  previewArtifact(input: { runId: string; path: string }): Promise<string>;
+  exportLog(id: string): Promise<string | null>;
+  snapshot(): Promise<Snapshot>;
+  create(): Promise<Conversation>;
+  messages(id: string): Promise<Message[]>;
+  models(): Promise<string[]>;
+  selectModel(model: string): Promise<void>;
+  send(input: SendInput): Promise<void>;
+  cancel(id: string): Promise<void>;
+  onMessage(listener: (event: ChatEvent) => void): () => void;
+}
+declare global { interface Window { nix: Bridge } }

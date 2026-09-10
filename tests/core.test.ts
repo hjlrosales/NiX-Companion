@@ -1,0 +1,93 @@
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { createServer } from 'node:http';
+import { Store } from '../src/storage/database';
+import { ChatRuntime, context } from '../src/runtime/chat';
+import { Ollama, type ModelAdapter } from '../src/models/ollama';
+import type { ChatEvent } from '../src/shared/contracts';
+
+const adapter = (chat: ModelAdapter['chat']): ModelAdapter => ({ models: async () => ['local:8b'], chat });
+test('SQLite preserves history, settings and partial replies across restart', () => {
+  const folder = mkdtempSync(join(tmpdir(), 'nix-store-'));
+  try {
+    let store = new Store(join(folder, 'test.db'));
+    const conversation = store.create();
+    const message = store.begin(conversation.id, 'Remember blue', 'local:8b');
+    message.content = 'Partial reply'; store.save(message); store.setModel('local:8b'); store.close();
+    store = new Store(join(folder, 'test.db'));
+    assert.equal(store.model(), 'local:8b');
+    assert.equal(store.list()[0].title, 'Remember blue');
+    assert.equal(store.messages(conversation.id)[0].content, 'Remember blue');
+    assert.equal(store.messages(conversation.id)[1].status, 'interrupted');
+    assert.equal(store.messages(conversation.id)[1].content, 'Partial reply');
+    store.close();
+  } finally { rmSync(folder, { recursive: true, force: true }); }
+});
+test('chat streams, persists completion and sends previous conversation context', async () => {
+  const store = new Store(':memory:'); const id = store.create().id;
+  const events: ChatEvent[] = [];
+  let calls = 0;
+  const runtime = new ChatRuntime(store, adapter(async (_model, messages, _signal, chunk) => {
+    if (calls++) assert.ok(messages.some(m => m.content === 'Hello NiX'));
+    chunk('Hello'); chunk(' there');
+  }), e => events.push(e));
+  await runtime.send({ conversationId: id, content: 'Hello NiX', model: 'local:8b' }); await runtime.idle();
+  assert.equal(store.messages(id)[1].content, 'Hello there');
+  assert.equal(events.at(-1)?.message.status, 'complete');
+  await runtime.send({ conversationId: id, content: 'Continue', model: 'local:8b' }); await runtime.idle();
+  assert.equal(store.messages(id).length, 4); store.close();
+});
+test('malformed calls and unavailable models never invoke inference or write messages', async () => {
+  const store = new Store(':memory:'); const id = store.create().id; let calls = 0;
+  const runtime = new ChatRuntime(store, adapter(async () => { calls++; }), () => {});
+  for (const input of [{ conversationId: id, content: '', model: 'local:8b' }, { conversationId: '../bad', content: 'Hi', model: 'local:8b' }, { conversationId: id, content: 'Hi', model: 'cloud' }, { conversationId: id, content: 'a'.repeat(6001), model: 'local:8b' }]) await assert.rejects(runtime.send(input));
+  assert.equal(calls, 0); assert.equal(store.messages(id).length, 0); store.close();
+});
+test('cancellation preserves partial output, blocks concurrent sends and releases slot', async () => {
+  const store = new Store(':memory:'); const id = store.create().id;
+  const runtime = new ChatRuntime(store, adapter(async (_model, _messages, signal, chunk) => {
+    chunk('Partial'); await new Promise<void>((_resolve, reject) => signal.addEventListener('abort', () => reject(signal.reason), { once: true }));
+  }), () => {});
+  await runtime.send({ conversationId: id, content: 'Hi', model: 'local:8b' });
+  await assert.rejects(runtime.send({ conversationId: id, content: 'Second', model: 'local:8b' }));
+  runtime.cancel(id); await runtime.idle();
+  assert.equal(store.messages(id)[1].status, 'cancelled'); assert.equal(store.messages(id)[1].content, 'Partial'); assert.equal(runtime.activeId(), null); store.close();
+});
+test('timeouts and inference failures are persisted as errors', async () => {
+  for (const mode of ['timeout', 'error', 'empty']) {
+    const store = new Store(':memory:'); const id = store.create().id;
+    const runtime = new ChatRuntime(store, adapter(async (_model, _messages, signal) => {
+      if (mode === 'error') throw new Error('Model failure');
+      if (mode === 'timeout') await new Promise<void>((_resolve, reject) => signal.addEventListener('abort', () => reject(signal.reason), { once: true }));
+    }), () => {}, 10);
+    await runtime.send({ conversationId: id, content: 'Hi', model: 'local:8b' }); await runtime.idle();
+    assert.equal(store.messages(id)[1].status, 'error'); assert.ok(store.messages(id)[1].error); assert.equal(runtime.activeId(), null); store.close();
+  }
+});
+test('context retains latest prompt and bounds older content', () => {
+  const result = context(Array.from({ length: 30 }, (_, i) => ({ role: 'user', content: `${i}:` + 'x'.repeat(1000) })));
+  assert.equal(result[0].role, 'system'); assert.ok(result.at(-1)?.content.startsWith('29:')); assert.ok(result.slice(1).reduce((n, m) => n + m.content.length, 0) <= 10000);
+});
+test('Ollama parser handles split UTF-8, final line without newline, errors and truncated streams', async () => {
+  let mode = 'good';
+  const server = createServer((_req, res) => {
+    res.setHeader('Content-Type', 'application/x-ndjson');
+    if (mode === 'truncated') return res.end('{"message":{"content":"partial"}}\n');
+    if (mode === 'malformed') return res.end('invalid\n');
+    if (mode === 'error') return res.end('{"error":"out of memory"}\n');
+    const bytes = Buffer.from('{"message":{"content":"Hi 🌱"},"done":false}\n{"done":true}');
+    for (const byte of bytes) res.write(Buffer.from([byte]));
+    res.end();
+  });
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address() as { port: number };
+  try {
+    const model = new Ollama(`http://127.0.0.1:${address.port}`); let result = '';
+    await model.chat('local', [], new AbortController().signal, text => { result += text; }); assert.equal(result, 'Hi 🌱');
+    for (mode of ['truncated', 'malformed', 'error']) await assert.rejects(model.chat('local', [], new AbortController().signal, () => {}));
+    assert.throws(() => new Ollama('https://example.com')); assert.throws(() => new Ollama('http://localhost@evil.example'));
+  } finally { await new Promise<void>(resolve => server.close(() => resolve())); }
+});

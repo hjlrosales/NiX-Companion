@@ -1,0 +1,19 @@
+import { z } from 'zod';
+import { Registry } from './registry';
+import { Workspace } from '../executors/workspace';
+import { Processes } from '../executors/processes';
+import type { RunInput } from '../shared/agent';
+const path = z.string().min(1).max(500);
+export function executionRegistry(input: RunInput, processes: Processes) {
+  const files = new Workspace(input.workspace); const registry = new Registry();
+  registry.add({ name: 'files_list', description: 'List up to 300 entries inside the selected workspace.', schema: z.object({ path: path.default('.') }).strict(), policy: 'allow', execute: async a => ({ output: await files.list(a.path), evidence: [`Listed ${a.path}`] }) });
+  registry.add({ name: 'files_read', description: 'Read UTF-8 text inside the selected workspace (up to 12,000 characters).', schema: z.object({ path }).strict(), policy: 'allow', execute: async a => ({ output: await files.read(a.path), evidence: [`Read ${a.path}`] }) });
+  registry.add({ name: 'files_write', description: 'Create or replace a UTF-8 file in the workspace. Review content before approving.', schema: z.object({ path, content: z.string().max(60000) }).strict(), policy: 'ask', execute: async (a, c) => { c.signal.throwIfAborted(); const target = await files.write(a.path, a.content); return { output: `Wrote ${a.content.length} characters to ${a.path}`, artifacts: [target], evidence: [`Wrote ${a.path}`] }; } });
+  registry.add({ name: 'files_move', description: 'Move a file within the workspace without overwriting the destination.', schema: z.object({ source: path, destination: path }).strict(), policy: 'ask', execute: async a => ({ output: await files.move(a.source, a.destination) }) });
+  registry.add({ name: 'files_delete', description: 'Permanently delete one file from the workspace.', schema: z.object({ path }).strict(), policy: 'ask', execute: async a => { await files.remove(a.path); return { output: `Deleted ${a.path}` }; } });
+  registry.add({ name: 'terminal_start', description: input.mode === 'docker' ? 'Run a Linux shell command in Docker, mounted at /workspace. Packages/CLI commands execute inside the container. Returns a process session to poll.' : 'Run a PowerShell command with the current Windows user rights. This is NOT an OS sandbox: commands can access files and network outside the workspace. Returns a process session to poll.', schema: z.object({ command: z.string().min(1).max(12000) }).strict(), policy: 'ask', execute: async (a, c) => ({ output: JSON.stringify(await processes.start(c.runId, input.workspace, input.mode as 'host' | 'docker', input.network, a.command, c.signal)) }) });
+  registry.add({ name: 'terminal_poll', description: 'Read bounded process output and exit status for this run.', schema: z.object({ sessionId: z.string().uuid() }).strict(), policy: 'allow', execute: async (a, c) => { const result = processes.poll(c.runId, a.sessionId); return { output: JSON.stringify(result), evidence: result.running ? [] : [`Process ${a.sessionId} exited ${result.exitCode}`] }; } });
+  registry.add({ name: 'terminal_input', description: 'Send text or a newline to a process belonging to this run.', schema: z.object({ sessionId: z.string().uuid(), text: z.string().max(8000) }).strict(), policy: 'ask', execute: async (a, c) => ({ output: JSON.stringify(processes.write(c.runId, a.sessionId, a.text)) }) });
+  registry.add({ name: 'terminal_stop', description: 'Terminate a process tree/container belonging to this run.', schema: z.object({ sessionId: z.string().uuid() }).strict(), policy: 'allow', execute: async (a, c) => { await processes.stop(c.runId, a.sessionId); return { output: 'Process terminated.' }; } });
+  return registry;
+}
