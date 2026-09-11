@@ -1,6 +1,10 @@
 import { z } from 'zod';
-import type { RunInput, AgentState, AuditEvent } from './agent';
+import type { RunInput, AgentState, AuditEvent, ImportedFile, Run } from './agent';
+import type { TaskSkill } from './task-skills';
 import type { IntegrationConfig } from './integrations';
+import type { CapabilityManifest } from './capabilities';
+import type { DeviceDescriptor, DeviceToolName } from './devices';
+import type { ExecutionTrace, LearnedSkill, SkillValidation } from './learned-skills';
 export const idSchema = z.string().uuid();
 export const sendSchema = z.object({ conversationId: idSchema, content: z.string().trim().min(1).max(6000), model: z.string().min(1).max(200) }).strict();
 export type SendInput = z.infer<typeof sendSchema>;
@@ -18,6 +22,17 @@ export type SetupStatus = {
 };
 export interface Bridge {
   setupStatus(): Promise<SetupStatus>;
+  capabilities(): Promise<CapabilityManifest[]>;
+  devices(): Promise<{ devices: DeviceDescriptor[]; errors: string[] }>;
+  discoverDevices(): Promise<{ devices: DeviceDescriptor[]; errors: string[] }>;
+  invokeDevice(input: { deviceId: string; tool: DeviceToolName; args?: Record<string, unknown> }): Promise<{ output: string; state?: Record<string, unknown>; evidence?: string[] }>;
+  taskSkills(): Promise<TaskSkill[]>;
+  deleteTaskSkill(id: string): Promise<void>;
+  executionTrace(id: string): Promise<ExecutionTrace>;
+  similarSuccessfulTasks(id: string): Promise<Run[]>;
+  proposeSkill(input: { runIds: string[]; name?: string }): Promise<LearnedSkill>;
+  validateSkill(input: { skill: LearnedSkill; testRunId?: string }): Promise<SkillValidation>;
+  installSkill(skill: LearnedSkill): Promise<TaskSkill>;
   pullModel(model: string): Promise<string[]>;
   voiceStatus(): Promise<{ready:boolean;busy:boolean}>;
   setupVoice(): Promise<{ready:boolean;busy:boolean}>;
@@ -30,11 +45,14 @@ export interface Bridge {
   agentState(): Promise<AgentState>;
   runEvents(id: string): Promise<AuditEvent[]>;
   startRun(input: RunInput): Promise<string>;
+  replyRun(input: { id: string; content: string }): Promise<string>;
   resumeRun(id: string): Promise<string>;
+  deleteRun(id: string): Promise<void>;
   cancelRun(id: string): Promise<void>;
   approve(input: { id: string; allow: boolean; remember: boolean }): Promise<void>;
   acceptRun(id: string): Promise<void>;
   pickWorkspace(): Promise<string | null>;
+  importFiles(input: { workspace: string }): Promise<ImportedFile[]>;
   workspace(): Promise<string>;
   onAgent(listener: () => void): () => void;
   openArtifact(input: { runId: string; path: string }): Promise<void>;
@@ -42,6 +60,7 @@ export interface Bridge {
   exportLog(id: string): Promise<string | null>;
   snapshot(): Promise<Snapshot>;
   create(): Promise<Conversation>;
+  deleteConversation(id: string): Promise<void>;
   messages(id: string): Promise<Message[]>;
   models(): Promise<string[]>;
   selectModel(model: string): Promise<void>;

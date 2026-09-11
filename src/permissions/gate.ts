@@ -1,17 +1,18 @@
 import { randomUUID } from 'node:crypto';
 import type { Approval } from '../shared/agent';
+import type { CapabilityPermission } from '../shared/capabilities';
 export type Policy = 'allow' | 'ask' | 'deny';
 export class PermissionGate {
   private pending = new Map<string, { request: Approval; resolve: (allowed: boolean) => void }>();
   private grants = new Map<string, Set<string>>();
   constructor(private changed: () => void, private audit: (run: string, type: string, data: unknown) => void) {}
   list() { return [...this.pending.values()].map(p => p.request); }
-  async check(runId: string, tool: string, args: unknown, policy: Policy, description: string, signal: AbortSignal) {
+  async check(runId: string, tool: string, args: unknown, policy: Policy, description: string, signal: AbortSignal, autoApprove = false, metadata: { capabilityId?: string; capabilityName?: string; permissions?: CapabilityPermission[] } = {}) {
     signal.throwIfAborted();
     const key = JSON.stringify([tool, args]);
     if (policy === 'deny') { this.audit(runId, 'permission.denied', { tool, arguments: args }); return false; }
-    if (policy === 'allow' || this.grants.get(runId)?.has(key)) { this.audit(runId, 'permission.allowed', { tool, arguments: args, policy }); return true; }
-    const request: Approval = { id: randomUUID(), runId, tool, arguments: args, description };
+    if (policy === 'allow' || autoApprove || this.grants.get(runId)?.has(key)) { this.audit(runId, autoApprove && policy === 'ask' ? 'permission.auto_approved' : 'permission.allowed', { tool, arguments: args, policy }); return true; }
+    const request: Approval = { id: randomUUID(), runId, tool, arguments: args, description, ...metadata };
     return new Promise<boolean>(resolve => {
       const abort = () => finish(false);
       const finish = (allowed: boolean) => {

@@ -1,11 +1,11 @@
 import { app, BrowserWindow, ipcMain, session, dialog, shell, safeStorage } from 'electron';
 import { execFile } from 'node:child_process';
-import { join, relative, isAbsolute } from 'node:path';
-import { writeFile, realpath, readFile, stat } from 'node:fs/promises';
+import { join, relative, isAbsolute, basename, extname } from 'node:path';
+import { writeFile, realpath, readFile, stat, mkdir, copyFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
 import { Store } from '../storage/database';
-import { Ollama } from '../models/ollama';
+import { downloadableModels, ModelRouter } from '../models/ollama';
 import { ChatRuntime } from '../runtime/chat';
 import { idSchema, sendSchema } from '../shared/contracts';
 import { z } from 'zod';
@@ -18,16 +18,24 @@ import { documentTools } from '../tools/documents';
 import { McpConnections } from '../tools/mcp';
 import { BrowserSessions } from '../tools/browser';
 import { windowsTools } from '../tools/windows';
+import { hereticTools } from '../tools/heretic';
+import { processReportTools } from '../tools/process-report';
+import { taskSkillTools } from '../tools/task-skills';
+import { mergeTaskSkills } from '../shared/task-skills';
 import { defaultIntegrationConfig, normalizeIntegrationConfig, type IntegrationConfig } from '../shared/integrations';
 import { HomeAssistant } from '../devices/home-assistant';
+import { DeviceRuntime, deviceTools } from '../devices/registry';
+import { deviceToolNameSchema } from '../shared/devices';
 import { VoiceService } from '../voice/service';
+import { buildCapabilityRegistry } from '../shared/capabilities';
+import { buildExecutionTrace, learnedSkillSchema, learnedSkillToTaskSkill, synthesizeSkill, validateSkill } from '../shared/learned-skills';
 
 if (process.env.NIX_USER_DATA) app.setPath('userData', process.env.NIX_USER_DATA);
 const single = app.requestSingleInstanceLock();
 if (!single) app.quit();
 else void app.whenReady().then(() => {
   const store = new Store(join(app.getPath('userData'), 'nix.db'));
-  const adapter = new Ollama(process.env.NIX_OLLAMA_URL);
+  const adapter = new ModelRouter(process.env.NIX_OLLAMA_URL);
   let window: BrowserWindow;
   const processes = new Processes();
   const browsers = new BrowserSessions();
@@ -35,7 +43,7 @@ else void app.whenReady().then(() => {
   let microphoneUntil=0;
   const commandCheck=(file:string,args:string[],timeout=5000)=>new Promise<string>((resolve,reject)=>execFile(file,args,{windowsHide:true,timeout,maxBuffer:200000},(error,stdout,stderr)=>error?reject(new Error(stderr||error.message)):resolve(stdout.trim())));
   const setupStatus=async()=>{
-    const modelResult=await adapter.models().then(models=>({ok:true as const,models,detail:models.length?`${models.length} local model(s)`:'Ollama is running; no local models installed.'})).catch((error:Error)=>({ok:false as const,models:[],detail:error.message}));
+    const modelResult=await adapter.models().then(models=>({ok:true as const,models,detail:models.length?`${models.length} available model(s)`:'Ollama is running; no local models installed and no API models are configured.'})).catch((error:Error)=>({ok:false as const,models:[],detail:error.message}));
     const docker=await commandCheck('docker',['info','--format','{{.ServerVersion}}']).then(version=>({ok:true,detail:`Docker ${version}`})).catch(error=>({ok:false,detail:error.message}));
     const officeOk=process.platform!=='win32'||existsSync('C:\\Program Files\\Microsoft Office\\root\\Office16\\WINWORD.EXE')||existsSync('C:\\Program Files (x86)\\Microsoft Office\\root\\Office16\\WINWORD.EXE');
     const edgeOk=process.platform!=='win32'||existsSync('C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe')||existsSync('C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe');
@@ -54,16 +62,30 @@ else void app.whenReady().then(() => {
     if(!safeStorage.isEncryptionAvailable())throw new Error('Windows credential encryption is unavailable.');
     return normalizeIntegrationConfig(JSON.parse(safeStorage.decryptString(Buffer.from(encoded,'base64'))));
   };
-  let integrations=loadIntegrations(); let mcp=new McpConnections(integrations.mcp);
+  let integrations=loadIntegrations(); adapter.updateProviders(integrations.aiProviders); let mcp=new McpConnections(integrations.mcp);
+  const deviceRuntime=()=>{const runtime=new DeviceRuntime([],integrations.services);if(integrations.homeAssistant)runtime.add(new HomeAssistant(integrations.homeAssistant));return runtime;};
   const changed = () => { if (window && !window.isDestroyed()) window.webContents.send('nix:agent-changed'); };
+  const capabilityLastUsed = () => {
+    const used: Record<string, number> = {};
+    for (const run of store.runs()) for (const event of store.events(run.id).filter(item => item.type === 'tool.started')) {
+      try { const data = JSON.parse(event.data); if (typeof data.capability?.id === 'string') used[data.capability.id] = Math.max(used[data.capability.id] ?? 0, event.createdAt); } catch {}
+    }
+    return used;
+  };
+  const capabilities = () => buildCapabilityRegistry({
+    integrations,
+    userSkills: store.userTaskSkills(),
+    platform: process.platform,
+    lastUsed: capabilityLastUsed()
+  });
   const agent = new AgentRuntime(store, adapter, input => {
-    if(input.mode==='mock')return mockRegistry();
-    const registry=executionRegistry(input,processes);if(input.mode==='docker')return registry;
-    documentTools(registry,input.workspace,app.getAppPath());mcp.addTools(registry);
+    if(input.mode==='mock')return taskSkillTools(mockRegistry(),store,changed);
+    const registry=taskSkillTools(executionRegistry(input,processes),store,changed);if(input.mode==='docker')return registry;
+    documentTools(registry,input.workspace,app.getAppPath());processReportTools(registry,input.workspace,app.getAppPath());hereticTools(registry,input,processes);mcp.addTools(registry);deviceTools(registry,deviceRuntime());
     if(integrations.browser)browsers.addTools(registry,input.workspace);
     if(integrations.windows)windowsTools(registry,input.workspace,app.getAppPath());
     if(integrations.homeAssistant)new HomeAssistant(integrations.homeAssistant).addTools(registry);return registry;
-  }, changed, undefined, async id => {await Promise.all([processes.cleanup(id),mcp.cleanup(id),browsers.cleanup(id)]);});
+  }, changed, undefined, async id => {await Promise.all([processes.cleanup(id),mcp.cleanup(id),browsers.cleanup(id)]);}, capabilities);
   const runtime = new ChatRuntime(store, adapter, event => { if (!window.isDestroyed()) window.webContents.send('nix:message', event); });
   const entry = pathToFileURL(join(__dirname, '../renderer/index.html')).href;
   const handle = (name: string, action: (data: unknown) => unknown) => ipcMain.handle(name, (event, data: unknown) => {
@@ -72,8 +94,57 @@ else void app.whenReady().then(() => {
   });
   handle('nix:snapshot', () => ({ conversations: store.list(), selectedModel: store.model(), active: runtime.activeId() }));
   handle('nix:setup-status',()=>setupStatus());
-  handle('nix:pull-model',async data=>adapter.pull(z.enum(['qwen3:8b','qwen3:14b','qwen3-coder:30b']).parse(data),AbortSignal.timeout(60*60*1000)));
+  handle('nix:capabilities',()=>capabilities());
+  handle('nix:devices',()=>deviceRuntime().list(AbortSignal.timeout(15000)));
+  handle('nix:devices-discover',()=>deviceRuntime().discover(AbortSignal.timeout(30000)));
+  handle('nix:device-invoke',async data=>{
+    const input=z.object({deviceId:z.string().min(1).max(140),tool:deviceToolNameSchema,args:z.record(z.string(),z.unknown()).default({})}).strict().parse(data);
+    return deviceRuntime().invoke(input.deviceId,input.tool,input.args,AbortSignal.timeout(30000));
+  });
+  handle('nix:task-skills',()=>mergeTaskSkills(store.userTaskSkills()));
+  handle('nix:delete-task-skill',data=>{store.deleteUserTaskSkill(z.string().regex(/^[a-z0-9][a-z0-9-]{1,48}$/).parse(data));changed();});
+  const traceFor = (id: string) => buildExecutionTrace(store.run(id), store.events(id));
+  handle('nix:execution-trace',data=>traceFor(idSchema.parse(data)));
+  handle('nix:similar-successful-tasks',data=>{
+    const run=store.run(idSchema.parse(data));
+    const words=new Set(run.goal.toLowerCase().split(/\W+/).filter(word=>word.length>3));
+    return store.runs().filter(item=>{
+      if(item.status!=='completed')return false;
+      const overlap=item.goal.toLowerCase().split(/\W+/).filter(word=>words.has(word)).length;
+      return item.id===run.id||overlap>=2;
+    }).slice(0,6);
+  });
+  handle('nix:propose-skill',data=>{
+    const input=z.object({runIds:z.array(idSchema).min(1).max(8),name:z.string().trim().min(1).max(80).optional()}).strict().parse(data);
+    return synthesizeSkill(input.runIds.map(traceFor),input.name);
+  });
+  handle('nix:validate-skill',data=>{
+    const input=z.object({skill:learnedSkillSchema,testRunId:idSchema.optional()}).strict().parse(data);
+    const availableTools=capabilities().flatMap(capability=>capability.enabled?capability.tools.map(tool=>tool.name):[]);
+    return validateSkill(input.skill,availableTools,input.testRunId?traceFor(input.testRunId):undefined);
+  });
+  handle('nix:install-skill',data=>{
+    const skill=learnedSkillSchema.parse(data);
+    const availableTools=capabilities().flatMap(capability=>capability.enabled?capability.tools.map(tool=>tool.name):[]);
+    const validation=validateSkill(skill,availableTools);
+    if(!validation.workflowRecognized||!validation.requiredToolsAvailable||!validation.permissionsValid||!validation.outputVerified)throw new Error(`Skill is not ready to install: ${validation.messages.join(' ')}`);
+    const taskSkill=learnedSkillToTaskSkill(skill);
+    store.upsertUserTaskSkill(taskSkill);changed();
+    return taskSkill;
+  });
+  handle('nix:pull-model',async data=>adapter.pull(z.enum(downloadableModels).parse(data),AbortSignal.timeout(60*60*1000)));
   handle('nix:create', () => store.create());
+  handle('nix:delete-conversation', data => {
+    const id = idSchema.parse(data);
+    if (runtime.activeId() === id) throw new Error('Stop the active reply before deleting this conversation.');
+    store.deleteConversation(id);
+  });
+  handle('nix:delete-run', data => {
+    const id = idSchema.parse(data);
+    if (agent.state().active === id) throw new Error('Stop the active task before deleting this task history.');
+    store.deleteRun(id);
+    changed();
+  });
   handle('nix:messages', data => store.messages(idSchema.parse(data)));
   handle('nix:models', () => adapter.models());
   handle('nix:model', data => store.setModel(z.string().min(1).max(200).parse(data)));
@@ -86,7 +157,7 @@ else void app.whenReady().then(() => {
   handle('nix:microphone',()=>{microphoneUntil=Date.now()+15000;});
   handle('nix:transcribe',data=>{if(!(data instanceof Uint8Array))throw new Error('Invalid recording.');return voice.transcribe(data);});
   handle('nix:speak',data=>voice.speak(z.string().min(1).max(3000).parse(data)));
-  handle('nix:integrations',()=>({...integrations,homeAssistant:integrations.homeAssistant?{...integrations.homeAssistant,token:'__SAVED__'}:undefined,mcp:integrations.mcp.map(config=>config.transport==='http'?{...config,token:config.token?'__SAVED__':undefined}:{...config,env:Object.fromEntries(Object.keys(config.env).map(key=>[key,'__SAVED__']))})}));
+  handle('nix:integrations',()=>({...integrations,aiProviders:integrations.aiProviders.map(provider=>({...provider,apiKey:provider.apiKey?'__SAVED__':undefined})),homeAssistant:integrations.homeAssistant?{...integrations.homeAssistant,token:'__SAVED__'}:undefined,mcp:integrations.mcp.map(config=>config.transport==='http'?{...config,token:config.token?'__SAVED__':undefined}:{...config,env:Object.fromEntries(Object.keys(config.env).map(key=>[key,'__SAVED__']))})}));
   handle('nix:save-integrations',async data=>{
     if(agent.state().active)throw new Error('Finish the active task before changing integrations.');
     if(!safeStorage.isEncryptionAvailable())throw new Error('Cannot securely save credentials on this system.');
@@ -96,7 +167,8 @@ else void app.whenReady().then(() => {
       if(server.transport==='stdio')for(const key of Object.keys(server.env))if(server.env[key]==='__SAVED__'){if(old?.transport!=='stdio'||old.command!==server.command||!old.env[key])throw new Error('Enter environment credentials for this server.');server.env[key]=old.env[key];}
     }
     if(next.homeAssistant){if(next.homeAssistant.token==='__SAVED__'){if(integrations.homeAssistant?.url!==next.homeAssistant.url)throw new Error('Enter the token for this Home Assistant.');next.homeAssistant.token=integrations.homeAssistant.token;}await new HomeAssistant(next.homeAssistant).verify(AbortSignal.timeout(30000));}
-    store.setSetting('integrations',safeStorage.encryptString(JSON.stringify(next)).toString('base64'));integrations=next;mcp=new McpConnections(next.mcp);
+    for(const provider of next.aiProviders){const old=integrations.aiProviders.find(p=>p.provider===provider.provider);if(provider.apiKey==='__SAVED__'){if(!old?.apiKey||old.baseUrl!==provider.baseUrl)throw new Error(`Enter a new API key for ${provider.provider}.`);provider.apiKey=old.apiKey;}}
+    store.setSetting('integrations',safeStorage.encryptString(JSON.stringify(next)).toString('base64'));integrations=next;adapter.updateProviders(next.aiProviders);mcp=new McpConnections(next.mcp);
   });
   handle('nix:events', data => store.events(idSchema.parse(data)));
   handle('nix:workspace', () => store.setting('workspace') ?? '');
@@ -106,19 +178,49 @@ else void app.whenReady().then(() => {
     if (result.canceled) return null;
     const root = await realpath(result.filePaths[0]); store.setSetting('workspace', root); return root;
   });
+  handle('nix:import-files', async data => {
+    const input = z.object({ workspace: z.string().min(1).max(1000) }).strict().parse(data);
+    if (agent.state().active) throw new Error('Finish the active task before importing files.');
+    if (input.workspace !== store.setting('workspace')) throw new Error('Select this workspace using the folder picker first.');
+    const root = await realpath(input.workspace);
+    const result = await dialog.showOpenDialog(window, { title: 'Import files for NiX to analyze', properties: ['openFile', 'multiSelections'], filters: [{ name: 'Supported files', extensions: ['pdf','docx','pptx','txt','md','csv','json','log','inp','dat','yaml','yml','xml','png','jpg','jpeg','tiff','bmp'] }, { name: 'All files', extensions: ['*'] }] });
+    if (result.canceled) return [];
+    const folder = join(root, '.nix-imports'); await mkdir(folder, { recursive: true });
+    const imported = [];
+    for (const source of result.filePaths.slice(0, 20)) {
+      const resolved = await realpath(source);
+      const stats = await stat(resolved);
+      if (!stats.isFile()) continue;
+      if (stats.size > 50_000_000) throw new Error(`${basename(source)} exceeds the 50 MB import limit.`);
+      const safeName = basename(source).replace(/[<>:"/\\|?*\x00-\x1F]/g, '_').slice(0, 180);
+      const targetName = `${Date.now()}-${imported.length + 1}-${safeName}`;
+      const target = join(folder, targetName);
+      await copyFile(resolved, target);
+      imported.push({ path: relative(root, target), name: basename(source), kind: extname(source).slice(1).toLowerCase() || 'file' });
+    }
+    return imported;
+  });
   handle('nix:run', async data => {
     if (runtime.activeId()) throw new Error('Finish the current chat reply first.');
     const input = runInputSchema.parse(data);
     if (input.mode !== 'mock' && input.workspace !== store.setting('workspace')) throw new Error('Select a workspace using the folder picker first.');
-    if (!(await adapter.models()).includes(input.model)) throw new Error('Select an installed local model.');
+    if (!(await adapter.models()).includes(input.model)) throw new Error('Select an installed local model or configured API model.');
     return agent.start(input);
+  });
+  handle('nix:reply-run', async data => {
+    if (runtime.activeId()) throw new Error('Finish the current chat reply first.');
+    const input = z.object({ id: idSchema, content: runInputSchema.shape.goal }).strict().parse(data);
+    const previous = store.run(input.id);
+    if (previous.mode !== 'mock' && previous.workspace !== store.setting('workspace')) throw new Error('Select the original workspace before replying.');
+    if (!(await adapter.models()).includes(previous.model)) throw new Error('The original model must be installed or configured to continue this task.');
+    return agent.reply(input.id, input.content);
   });
   handle('nix:resume', async data => {
     if (runtime.activeId()) throw new Error('Finish the current chat reply first.');
     const previous = store.run(idSchema.parse(data));
     if (previous.mode !== 'mock' && previous.workspace !== store.setting('workspace')) throw new Error('Select the original workspace before resuming.');
-    if (!(await adapter.models()).includes(previous.model)) throw new Error('The original model must be installed to resume.');
-    return agent.start(runInputSchema.parse({ goal: previous.goal, model: previous.model, mode: previous.mode, workspace: previous.workspace, network: previous.network }), previous.id);
+    if (!(await adapter.models()).includes(previous.model)) throw new Error('The original model must be installed or configured to resume.');
+    return agent.start(runInputSchema.parse({ goal: previous.goal, model: previous.model, mode: previous.mode, permissionMode: previous.permissionMode, workspace: previous.workspace, network: previous.network, teach: previous.teach, attachments: previous.attachments }), previous.id);
   });
   handle('nix:stop-run', data => agent.cancel(idSchema.parse(data)));
   handle('nix:approve', data => { const p = z.object({ id: idSchema, allow: z.boolean(), remember: z.boolean() }).strict().parse(data); agent.gate.decide(p.id, p.allow, p.remember); });

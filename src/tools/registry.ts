@@ -1,13 +1,15 @@
 import { z } from 'zod';
 import type { Policy } from '../permissions/gate';
 import type { ToolSpec } from '../shared/agent';
+import type { CapabilityPermission } from '../shared/capabilities';
 export type ToolContext = { runId: string; signal: AbortSignal };
 export type ToolResult = { output: string; evidence?: string[]; artifacts?: string[] };
-export type Tool = { name: string; description: string; schema: z.ZodType; policy: Policy; execute: (args: any, context: ToolContext) => Promise<ToolResult> };
+export type Tool = { name: string; description: string; schema: z.ZodType; policy: Policy; capabilityId?: string; permissions?: CapabilityPermission[]; execute: (args: any, context: ToolContext) => Promise<ToolResult> };
 export class Registry {
   private entries = new Map<string, Tool>();
   add(tool: Tool) { if (this.entries.has(tool.name)) throw new Error('Duplicate tool.'); this.entries.set(tool.name, tool); return this; }
   get(name: string) { const tool = this.entries.get(name); if (!tool) throw new Error(`Unknown tool: ${name}`); return tool; }
+  tools() { return [...this.entries.values()]; }
   specs(): ToolSpec[] { return [...this.entries.values()].map(t => ({ type: 'function', function: { name: t.name, description: t.description, parameters: z.toJSONSchema(t.schema) } })); }
 }
 export function mockRegistry() {

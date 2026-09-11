@@ -43,7 +43,7 @@ def extract(path):
                 if shape.has_text_frame: content.append(shape.text)
                 if shape.has_table: content.extend(' | '.join(c.text for c in row.cells) for row in shape.table.rows)
             parts.append({'reference':f'{path.name}#slide={i+1}','text':'\n'.join(content)})
-    elif ext in ['.txt','.md','.csv','.log','.json']:
+    elif ext in ['.txt','.md','.csv','.log','.json','.inp','.dat','.yaml','.yml','.xml']:
         text=path.read_text(encoding='utf-8')
         lines=text.splitlines()
         for start in range(0,len(lines),40): parts.append({'reference':f'{path.name}#line={start+1}','text':'\n'.join(lines[start:start+40])})
@@ -53,7 +53,7 @@ def extract(path):
                 page=pdf[0]; tessdata=os.environ.get('TESSDATA_PREFIX',r'C:\Program Files\Tesseract-OCR\tessdata')
                 text=page.get_text(textpage=page.get_textpage_ocr(language='eng', dpi=150, full=True, tessdata=tessdata))
                 parts=[{'reference':f'{path.name}#image=1','text':text,'ocr':True}]
-    else: raise ValueError('Supported inputs: PDF, DOCX, PPTX, text, Markdown, CSV, JSON and scanned images')
+    else: raise ValueError('Supported inputs: PDF, DOCX, PPTX, INP/DAT, text, Markdown, CSV, JSON, XML/YAML and scanned images')
     if sum(len(p['text']) for p in parts)>2_000_000: raise ValueError('Extracted text exceeds 2 million characters')
     return parts
 

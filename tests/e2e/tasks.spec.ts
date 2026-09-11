@@ -11,7 +11,7 @@ test('task UI gates writes, persists evidence and recovers pending approvals wit
     if(req.url==='/api/tags'){res.end(JSON.stringify({models:[{name:'local:8b'}]}));return;}
     let body='';req.on('data',d=>{body+=d;});req.on('end',()=>{
       const input=JSON.parse(body);const last=input.messages.at(-1);
-      const response=last.role==='tool'?{content:'The tool returned evidence. Review the output before accepting.'}:{content:'I propose creating the requested file.',tool_calls:[{function:{name:'files_write',arguments:{path:'proof.txt',content:'VERIFIED_TASK_WRITE'}}}]};
+      const response=last.content?.startsWith('Before finishing, inspect')?{content:'Validation remains incomplete; review the file.'}:last.content==='Explain the previous result'?{content:'The previous task wrote proof.txt.'}:last.role==='tool'?{content:'The tool returned evidence. Review the output before accepting.'}:{content:'I propose creating the requested file.',tool_calls:[{function:{name:'files_write',arguments:{path:'proof.txt',content:'VERIFIED_TASK_WRITE'}}}]};
       res.end(JSON.stringify({message:response,done:true}));
     });
   });await new Promise<void>(r=>server.listen(0,'127.0.0.1',r));
@@ -27,9 +27,15 @@ test('task UI gates writes, persists evidence and recovers pending approvals wit
     await expect(page.getByRole('dialog')).toBeVisible();expect(existsSync(join(workspace,'proof.txt'))).toBe(false);
     await page.screenshot({path:'test-results/nix-approval.png'});await page.getByRole('button',{name:'Deny',exact:true}).click();
     await expect(page.getByRole('button',{name:'Accept reviewed result'})).toBeVisible();expect(existsSync(join(workspace,'proof.txt'))).toBe(false);
+    await page.getByRole('button',{name:'New task',exact:true}).click();
     await page.getByLabel('Task goal').fill('Create proof with approval');await page.getByRole('button',{name:'Run task ↗'}).click();await page.getByRole('button',{name:'Allow once',exact:true}).click();
     await expect(page.getByRole('button',{name:'Accept reviewed result'})).toBeVisible();expect(readFileSync(join(workspace,'proof.txt'),'utf8')).toBe('VERIFIED_TASK_WRITE');
     await page.screenshot({path:'test-results/nix-task-evidence.png'});await page.getByRole('button',{name:'Accept reviewed result'}).click();
+    const beforeReply=await page.evaluate(()=>window.nix.agentState());
+    await page.getByLabel('Task goal').fill('Explain the previous result');await page.getByRole('button',{name:'Send reply',exact:false}).click();
+    await expect(page.locator('.task-conversation').getByText('The previous task wrote proof.txt.',{exact:true})).toBeVisible();
+    const afterReply=await page.evaluate(()=>window.nix.agentState());expect(afterReply.runs.length).toBe(beforeReply.runs.length);expect(afterReply.runs[0].id).toBe(beforeReply.runs[0].id);
+    await page.getByRole('button',{name:'New task',exact:true}).click();
     await page.getByLabel('Task goal').fill('A task interrupted before approval');await page.getByRole('button',{name:'Run task ↗'}).click();await expect(page.getByRole('dialog')).toBeVisible();
     const {execFile}=await import('node:child_process'); const pid=app.process().pid!;
     await new Promise<void>((resolve,reject)=>execFile('taskkill.exe',['/PID',String(pid),'/T','/F'],{windowsHide:true},error=>error?reject(error):resolve()));app=undefined;

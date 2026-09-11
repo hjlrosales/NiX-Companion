@@ -15,7 +15,12 @@ import { defaultIntegrationConfig, normalizeIntegrationConfig } from '../src/sha
 test('integration defaults include the user MCP servers and Claude mcpServers imports normalize',()=>{
   assert.deepEqual(defaultIntegrationConfig.mcp.map(server=>server.id),['blender','autodesk-mcp','nix-hydraulic-analyst']);
   assert.equal(defaultIntegrationConfig.browser,true);
+  assert.equal(defaultIntegrationConfig.windows,true);
+  assert.deepEqual(defaultIntegrationConfig.aiProviders,[]);
+  assert.equal(defaultIntegrationConfig.services[0].id,'netflix');
+  assert.equal(defaultIntegrationConfig.services[0].enabled,false);
   assert.deepEqual(normalizeIntegrationConfig({mcp:[],browser:false,windows:true}).mcp.map(server=>server.id),['blender','autodesk-mcp','nix-hydraulic-analyst']);
+  assert.deepEqual(normalizeIntegrationConfig({mcp:[],browser:false,windows:true,aiProviders:[{provider:'openai',apiKey:'key',models:['gpt-test']}]}).aiProviders[0].models,['gpt-test']);
   const converted=normalizeIntegrationConfig({mcpServers:{blender:{command:'C:\\Tools\\blender-mcp.exe'},'nix-hydraulic-analyst':{command:'node',args:['tsx','server.ts'],env:{NIX_DATA_DIR:'C:\\data'}}}},defaultIntegrationConfig);
   const blender=converted.mcp.find(server=>server.id==='blender');
   const hydraulic=converted.mcp.find(server=>server.id==='nix-hydraulic-analyst');
@@ -29,7 +34,7 @@ test('integration defaults include the user MCP servers and Claude mcpServers im
 
 test('MCP stdio discovers/calls a real server and validates arguments before invoking',async()=>{
   const mcp=new McpConnections([{id:'fixture',label:'Fixture',transport:'stdio',command:process.execPath,args:[join(process.cwd(),'tests/fixtures/mcp-server.mjs')],env:{}}]);const signal=new AbortController().signal;
-  try{assert.equal((await mcp.discover('run','fixture',signal))[0].name,'echo');assert.match(await mcp.call('run','fixture','echo',{text:'hello'},signal),/MCP_ECHO:hello/);await assert.rejects(mcp.call('run','fixture','echo',{text:123},signal));await assert.rejects(mcp.call('run','unpaired','echo',{text:'hello'},signal));}finally{await mcp.cleanup('run');}
+  try{const registry=new Registry();mcp.addTools(registry);const ctx={runId:'run',signal};const catalog=JSON.parse((await registry.get('mcp_discover').execute({serverId:'fixture',offset:0},ctx)).output);assert.equal(catalog.tools[0].name,'echo');const schema=JSON.parse((await registry.get('mcp_schema').execute({serverId:'fixture',tool:'echo'},ctx)).output);assert.ok(schema.inputSchema.properties.text);assert.equal((await mcp.discover('run','fixture',signal))[0].name,'echo');assert.match(await mcp.call('run','fixture','echo',{text:'hello'},signal),/MCP_ECHO:hello/);await assert.rejects(mcp.call('run','fixture','echo',{text:123},signal));await assert.rejects(mcp.call('run','unpaired','echo',{text:'hello'},signal));}finally{await mcp.cleanup('run');}
 });
 test('MCP Streamable HTTP authenticates, discovers and calls without redirecting credentials',async()=>{
   let count=0;

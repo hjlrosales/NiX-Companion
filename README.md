@@ -18,6 +18,7 @@ Install or start Ollama, then select an installed local model. The Settings view
 - `qwen3:8b` for the default local task model.
 - `qwen3:14b` for higher quality if the machine has enough headroom.
 - `qwen3-coder:30b` for slower coding experiments.
+- `hf.co/DavidAU/OpenAi-GPT-oss-20b-HERETIC-uncensored-NEO-Imatrix-gguf:Q5_1` for an Ollama-ready GGUF quant of the Hugging Face gpt-oss 20B Heretic model.
 
 ## Setup
 
@@ -33,9 +34,31 @@ py -3.13 -m venv .venv
 
 Voice setup downloads local Whisper and Kokoro model files into `.nix-models` in development. Packaged builds download voice models into Electron user data.
 
+Heretic local model conversion is available from Tasks in Host mode. Install Heretic in a Python 3.10+ environment that can access your GPU:
+
+```powershell
+py -3.12 -m pip install -U heretic-llm
+```
+
+Then open Tasks and ask NiX to convert a Hugging Face model ID or local model folder, or press `/` to select the Heretic capability/tool from the capability picker. NiX calls the internal `heretic_status` tool first, then `heretic_convert_start`. Those tool names appear in the task log with their owning capability, permissions, and result. NiX creates a `.nix-artifacts\heretic-*` workspace folder with `config.toml`, starts the `heretic` CLI, and can poll or answer the CLI prompts during the run. Converted model files are found in that run folder unless the Heretic CLI asks you to choose a different save location.
+
+The base `p-e-w/gpt-oss-20b-heretic` repository is Safetensors/Transformers-first. Ollama downloads need a runnable Ollama library model or GGUF quant, so NiX's one-click download uses a GGUF quantization of that model.
+
+To use ChatGPT/OpenAI or Claude, open Settings, click **Add ChatGPT / OpenAI** or **Add Claude**, paste the API key, save integrations, then refresh models. Configured API models appear in the normal model selector as `openai:model-name` or `anthropic:model-name`.
+
+Tasks include a manifest-backed capability system for skills, plugins, apps, and concrete tools. Open **Capabilities** to inspect what is installed, what permissions each tool needs, and when a capability was last used. You can add your own workflow skill by asking in Tasks, for example: `Add a NiX skill called INP QA that reads an imported .inp file, checks it against my constraints, uses the hydraulic MCP tools when available, and verifies the final file before reporting.` Skills guide the AI; plugins/apps expose tools; permissions are enforced by the runtime.
+
+TV casting depends on Windows, the TV, and network discovery; NiX can open the right Windows/Edge screens, but you may still need to click the TV or sign in because those prompts are intentionally interactive.
+
 Home Assistant pairing is configured in Settings JSON. Only explicitly paired `light.*` and `switch.*` entities are exposed to the model, and each device action still goes through the permission gate.
 
 The default MCP configuration includes the local Claude MCP servers for Blender, Autodesk Civil 3D, and NiX Hydraulic Analyst. Existing saved integration settings are merged with these defaults at load/save time. Settings also accepts Claude Desktop style JSON with a top-level `mcpServers` object and converts each entry to NiX's stdio MCP format.
+
+## Task conversations
+
+In Tasks, send a reply to refine the selected task. NiX keeps its original goal, earlier replies, evidence, and artifacts in the same history, including after restart. Replies use the task's original model and workspace. Wait for the current execution to finish or stop it before replying. Choose **New task** to start a separate history.
+
+For application workflows, NiX is instructed to discover the configured MCP server, inspect the selected tool schema, and call its tools. Discovery is paged so large catalogs do not lose schemas through truncation. Task inference uses an 8K context to leave room for tool schemas; older conversation context may be compacted. A file write alone triggers a verification reminder; review still requires checking the evidence and is not a guarantee of a complete or valid deliverable.
 
 ## Task Safety
 

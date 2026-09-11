@@ -8,6 +8,7 @@ import { Store } from '../src/storage/database';
 import { ChatRuntime, context } from '../src/runtime/chat';
 import { Ollama, type ModelAdapter } from '../src/models/ollama';
 import type { ChatEvent } from '../src/shared/contracts';
+import { buildExecutionTrace, learnedSkillToTaskSkill, synthesizeSkill, validateSkill } from '../src/shared/learned-skills';
 
 const adapter = (chat: ModelAdapter['chat']): ModelAdapter => ({ models: async () => ['local:8b'], chat });
 test('SQLite preserves history, settings and partial replies across restart', () => {
@@ -25,6 +26,60 @@ test('SQLite preserves history, settings and partial replies across restart', ()
     assert.equal(store.messages(conversation.id)[1].content, 'Partial reply');
     store.close();
   } finally { rmSync(folder, { recursive: true, force: true }); }
+});
+test('SQLite deletes one conversation and its messages only', () => {
+  const store = new Store(':memory:');
+  const first = store.create(); const second = store.create();
+  store.begin(first.id, 'Delete me', 'local:8b');
+  store.begin(second.id, 'Keep me', 'local:8b');
+  store.deleteConversation(first.id);
+  assert.throws(() => store.messages(first.id), /Conversation not found/);
+  assert.equal(store.messages(second.id)[0].content, 'Keep me');
+  assert.deepEqual(store.list().map(c => c.id), [second.id]);
+  store.close();
+});
+test('SQLite deletes one task run and its audit events only', () => {
+  const store = new Store(':memory:');
+  const first = { id: '11111111-1111-4111-8111-111111111111', taskId: '21111111-1111-4111-8111-111111111111', goal: 'Delete task', model: 'local:8b', mode: 'mock' as const, permissionMode: 'plan' as const, workspace: '.', network: false, teach: false, attachments: [], status: 'review' as const, summary: 'done', createdAt: 1 };
+  const second = { ...first, id: '33333333-3333-4333-8333-333333333333', taskId: '43333333-3333-4333-8333-333333333333', goal: 'Keep task' };
+  store.putRun(first); store.putRun(second); store.event(first.id, 'run.review', { summary: 'delete' }); store.event(second.id, 'run.review', { summary: 'keep' });
+  store.deleteRun(first.id);
+  assert.throws(() => store.run(first.id), /Run not found/);
+  assert.equal(store.events(second.id).length, 1);
+  assert.deepEqual(store.runs().map(run => run.id), [second.id]);
+  store.close();
+});
+test('SQLite stores, updates and deletes custom task skills', () => {
+  const store = new Store(':memory:');
+  const skill = { id: 'inp-qa', label: 'INP QA', note: 'Check INP files.', prompt: 'Read the INP file and verify it.', builtin: false as const };
+  store.upsertUserTaskSkill(skill);
+  assert.deepEqual(store.userTaskSkills(), [skill]);
+  store.upsertUserTaskSkill({ ...skill, note: 'Updated note.' });
+  assert.deepEqual(store.userTaskSkills().map(item => item.note), ['Updated note.']);
+  store.deleteUserTaskSkill(skill.id);
+  assert.deepEqual(store.userTaskSkills(), []);
+  assert.throws(() => store.deleteUserTaskSkill(skill.id), /Task skill not found/);
+  store.close();
+});
+test('learned skills synthesize workflow from accepted execution traces', () => {
+  const store = new Store(':memory:');
+  const run = { id: '11111111-1111-4111-8111-111111111111', taskId: '21111111-1111-4111-8111-111111111111', goal: 'Create verified report', model: 'local:8b', mode: 'mock' as const, permissionMode: 'plan' as const, workspace: '.', network: false, teach: true, attachments: [], status: 'completed' as const, summary: 'Report created and verified.', createdAt: 1 };
+  store.putRun(run);
+  store.event(run.id, 'teach.started', { note: 'capture workflow' });
+  store.event(run.id, 'tool.started', { name: 'files_read', capability: { id: 'filesystem', name: 'File System', type: 'plugin' }, permissions: ['filesystem.read'], arguments: { path: 'input.txt' } });
+  store.event(run.id, 'tool.result', { name: 'files_read', output: 'source text', evidence: ['Read input.txt'] });
+  store.event(run.id, 'tool.started', { name: 'files_write', capability: { id: 'filesystem', name: 'File System', type: 'plugin' }, permissions: ['filesystem.write'], arguments: { path: 'report.md' } });
+  store.event(run.id, 'tool.result', { name: 'files_write', output: 'Wrote report', artifacts: ['report.md'] });
+  store.event(run.id, 'run.review', { summary: 'Report created and verified.' });
+  store.event(run.id, 'user.accepted', { note: 'accepted' });
+  const trace = buildExecutionTrace(store.run(run.id), store.events(run.id));
+  assert.equal(trace.success, true);
+  assert.deepEqual(trace.toolsUsed, ['files_read', 'files_write']);
+  const skill = synthesizeSkill([trace], 'Verified Report');
+  assert.ok(skill.workflow.some(step => step.includes('files_read')));
+  assert.equal(validateSkill(skill, ['files_read', 'files_write']).requiredToolsAvailable, true);
+  assert.equal(learnedSkillToTaskSkill(skill).builtin, false);
+  store.close();
 });
 test('chat streams, persists completion and sends previous conversation context', async () => {
   const store = new Store(':memory:'); const id = store.create().id;
