@@ -188,6 +188,29 @@ export const baseCapabilityManifests: CapabilityManifest[] = [
     capabilities: ['device_control', 'device_discovery', 'remote_control']
   },
   {
+    id: 'device-manager',
+    name: 'Device Manager',
+    description: 'Discover, connect, and troubleshoot Bluetooth and WiFi devices including TVs, headphones, speakers, air conditioners, and other smart devices.',
+    version: '1.0.0',
+    author: 'NiX',
+    icon: 'DM',
+    type: 'skill',
+    status: 'ready',
+    enabled: true,
+    permissions: ['network.access', 'media.access'],
+    tools: [],
+    configuration: {},
+    capabilities: ['bluetooth_discovery', 'wifi_discovery', 'device_troubleshoot', 'device_pairing'],
+    instructions: 'Use device_discover to scan for nearby Bluetooth and WiFi devices. For each discovered device, check its connection state. If a device shows as disconnected, help the user troubleshoot: check if it is in pairing mode, verify Bluetooth/WiFi is enabled, and attempt reconnection. For connected devices, use device_list to identify available tools and device_invoke to control them. When a user attaches or mentions a device, list what can be done with it based on its advertised capabilities.',
+    triggerConditions: [
+      'The user mentions Bluetooth, WiFi, headphones, TV, aircon, speaker, or any physical device.',
+      'The user asks to find, connect, pair, or troubleshoot a device.',
+      'The user attaches a file or mentions connecting hardware.'
+    ],
+    allowedTools: ['device_list', 'device_discover', 'device_invoke'],
+    dependencies: ['device-registry']
+  },
+  {
     id: 'windows-desktop',
     name: 'Windows Desktop',
     description: 'Open trusted Windows settings, inspect accessibility controls, and capture desktop verification screenshots.',
@@ -278,9 +301,9 @@ export function buildCapabilityRegistry(options: { integrations: IntegrationConf
   if (windows) { windows.enabled = options.integrations.windows && platform === 'win32'; windows.status = windows.enabled ? 'ready' : 'unavailable'; }
   const devices = byId.get('device-registry');
   if (devices) {
-    const drivers = [options.integrations.homeAssistant ? 'Home Assistant' : null].filter(Boolean);
-    devices.enabled = drivers.length > 0;
-    devices.status = devices.enabled ? 'ready' : 'disabled';
+    const drivers = ['Bluetooth / WiFi', ...options.integrations.homeAssistant ? ['Home Assistant'] : []];
+    devices.enabled = true;
+    devices.status = 'ready';
     devices.configuration = { drivers, services: options.integrations.services.map(service => ({ id: service.id, name: service.name, enabled: service.enabled, authenticated: service.authenticated })) };
   }
   for (const skill of mergeTaskSkills(options.userSkills.filter((item): item is TaskSkill & { builtin: false } => !item.builtin))) {

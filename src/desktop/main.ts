@@ -1,9 +1,10 @@
 import { app, BrowserWindow, ipcMain, session, dialog, shell, safeStorage } from 'electron';
 import { execFile } from 'node:child_process';
-import { join, relative, isAbsolute, basename, extname } from 'node:path';
+import { join, relative, isAbsolute, basename, extname, dirname } from 'node:path';
 import { writeFile, realpath, readFile, stat, mkdir, copyFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
+import { randomUUID } from 'node:crypto';
 import { Store } from '../storage/database';
 import { downloadableModels, ModelRouter } from '../models/ollama';
 import { ChatRuntime } from '../runtime/chat';
@@ -24,11 +25,13 @@ import { taskSkillTools } from '../tools/task-skills';
 import { mergeTaskSkills } from '../shared/task-skills';
 import { defaultIntegrationConfig, normalizeIntegrationConfig, type IntegrationConfig } from '../shared/integrations';
 import { HomeAssistant } from '../devices/home-assistant';
+import { BluetoothWifiDriver } from '../devices/bluetooth-wifi';
 import { DeviceRuntime, deviceTools } from '../devices/registry';
 import { deviceToolNameSchema } from '../shared/devices';
 import { VoiceService } from '../voice/service';
 import { buildCapabilityRegistry } from '../shared/capabilities';
 import { buildExecutionTrace, learnedSkillSchema, learnedSkillToTaskSkill, synthesizeSkill, validateSkill } from '../shared/learned-skills';
+import { MAX_ATTACHMENT_SIZE, detectMimeType, processedAttachmentSchema, processorForAttachment, type AttachmentProcessorType, type ProcessedAttachment } from '../shared/attachments';
 
 if (process.env.NIX_USER_DATA) app.setPath('userData', process.env.NIX_USER_DATA);
 const single = app.requestSingleInstanceLock();
@@ -63,7 +66,7 @@ else void app.whenReady().then(() => {
     return normalizeIntegrationConfig(JSON.parse(safeStorage.decryptString(Buffer.from(encoded,'base64'))));
   };
   let integrations=loadIntegrations(); adapter.updateProviders(integrations.aiProviders); let mcp=new McpConnections(integrations.mcp);
-  const deviceRuntime=()=>{const runtime=new DeviceRuntime([],integrations.services);if(integrations.homeAssistant)runtime.add(new HomeAssistant(integrations.homeAssistant));return runtime;};
+  const deviceRuntime=()=>{const runtime=new DeviceRuntime([],integrations.services);runtime.add(new BluetoothWifiDriver());if(integrations.homeAssistant)runtime.add(new HomeAssistant(integrations.homeAssistant));return runtime;};
   const changed = () => { if (window && !window.isDestroyed()) window.webContents.send('nix:agent-changed'); };
   const capabilityLastUsed = () => {
     const used: Record<string, number> = {};
@@ -78,6 +81,42 @@ else void app.whenReady().then(() => {
     platform: process.platform,
     lastUsed: capabilityLastUsed()
   });
+  const attachmentFilters = [{ name: 'Supported files', extensions: ['png','jpg','jpeg','gif','webp','bmp','tif','tiff','pdf','doc','docx','txt','md','markdown','csv','tsv','json','log','inp','dat','yaml','yml','xml','js','jsx','ts','tsx','py','ps1','html','css','mp3','wav','m4a','ogg','mp4','mov','webm','avi','mkv'] }, { name: 'All files', extensions: ['*'] }];
+  const supportedProcessors = new Set<AttachmentProcessorType>(['image','document','audio','video','code','spreadsheet']);
+  const readTextPreview = async (path: string, processorType: AttachmentProcessorType, mimeType: string) => {
+    if (!['document','code','spreadsheet'].includes(processorType) || (!mimeType.startsWith('text/') && !['application/json','application/yaml','application/xml'].includes(mimeType))) return undefined;
+    const text = await readFile(path, 'utf8');
+    return text.slice(0, 12000);
+  };
+  const processAttachment = async (source: string, targetRoot: string): Promise<ProcessedAttachment | null> => {
+    const resolved = await realpath(source);
+    const stats = await stat(resolved);
+    if (!stats.isFile()) return null;
+    if (stats.size > MAX_ATTACHMENT_SIZE) throw new Error(`${basename(source)} exceeds the 50 MB attachment limit.`);
+    const safeName = basename(source).replace(/[<>:"/\\|?*\x00-\x1F]/g, '_').slice(0, 180);
+    const target = join(targetRoot, `${Date.now()}-${safeName}`);
+    await copyFile(resolved, target);
+    const header = await readFile(target).then(bytes => bytes.subarray(0, 16));
+    const mimeType = detectMimeType(safeName, header);
+    const processorType = processorForAttachment(safeName, mimeType);
+    const base = { id: randomUUID(), name: basename(source), mimeType, size: stats.size, source: target, processorType, metadata: { extension: extname(source).slice(1).toLowerCase() } };
+    if (!supportedProcessors.has(processorType)) return processedAttachmentSchema.parse({ ...base, status: 'error', error: 'This file type is not supported yet.' });
+    try {
+      const extractedContent = await readTextPreview(target, processorType, mimeType);
+      const routed = {
+        image: 'Image routed for vision analysis. Local vision extraction is not configured yet.',
+        document: 'Document routed for deterministic text extraction.',
+        audio: 'Audio routed for speech-to-text transcription. Local transcription is available through the voice subsystem.',
+        video: 'Video routed for audio transcription and representative frame analysis.',
+        code: 'Code/text file routed as structured text context.',
+        spreadsheet: 'Spreadsheet routed for table/text extraction.',
+        fallback: 'Fallback routing selected.'
+      }[processorType];
+      return processedAttachmentSchema.parse({ ...base, status: 'ready', extractedContent: extractedContent ? `${routed}\n\n${extractedContent}` : routed });
+    } catch (error) {
+      return processedAttachmentSchema.parse({ ...base, status: 'error', error: error instanceof Error ? error.message : 'Attachment processing failed.' });
+    }
+  };
   const agent = new AgentRuntime(store, adapter, input => {
     if(input.mode==='mock')return taskSkillTools(mockRegistry(),store,changed);
     const registry=taskSkillTools(executionRegistry(input,processes),store,changed);if(input.mode==='docker')return registry;
@@ -156,7 +195,33 @@ else void app.whenReady().then(() => {
   handle('nix:voice-cancel',()=>voice.cancel());
   handle('nix:microphone',()=>{microphoneUntil=Date.now()+15000;});
   handle('nix:transcribe',data=>{if(!(data instanceof Uint8Array))throw new Error('Invalid recording.');return voice.transcribe(data);});
-  handle('nix:speak',data=>voice.speak(z.string().min(1).max(3000).parse(data)));
+  const getVoiceProfile=()=>{const v=store.setting('voiceProfile');return v&&v!=='default'?v:undefined;};
+  const getVoicePreset=()=>store.setting('voicePreset')??'default';
+  handle('nix:speak',data=>{
+    const text=typeof data==='string'?data:z.object({text:z.string().min(1).max(3000)}).parse(data).text;
+    const voiceProfile=typeof data==='object'&&data!==null&&!Array.isArray(data)?(data as any).voiceProfile??getVoiceProfile():getVoiceProfile();
+    const voicePreset=typeof data==='object'&&data!==null&&!Array.isArray(data)?(data as any).voicePreset??getVoicePreset():getVoicePreset();
+    return voice.speak(text,voiceProfile,voicePreset);
+  });
+  handle('nix:speak-mp3',async data=>{
+    const input=z.object({texts:z.array(z.string().min(1).max(3000)).min(1).max(10),outputPath:z.string().min(1).max(2000),voiceProfile:z.string().optional(),voicePreset:z.string().optional()}).strict().parse(data);
+    const audioDir=join(app.getPath('documents'),'NiX Audio');
+    await mkdir(audioDir,{recursive:true});
+    const fullPath=join(audioDir,input.outputPath);
+    await voice.speakToMp3(input.texts,fullPath,input.voiceProfile??getVoiceProfile(),input.voicePreset??getVoicePreset());
+    return fullPath;
+  });
+  handle('nix:setup-xtts',()=>voice.setupXtts());
+  handle('nix:train-voice',async data=>{
+    const input=z.object({refAudioPath:z.string().min(1).max(2000),voiceId:z.string().min(1).max(100),voiceName:z.string().min(1).max(100)}).strict().parse(data);
+    return voice.trainVoice(input.refAudioPath,input.voiceId,input.voiceName);
+  });
+  handle('nix:list-voices',()=>voice.listVoices());
+  handle('nix:delete-voice',data=>voice.deleteVoice(z.string().min(1).max(100).parse(data)));
+  handle('nix:set-voice-profile',data=>{const v=z.string().min(1).max(500).parse(data);store.setSetting('voiceProfile',v);});
+  handle('nix:voice-profile',()=>store.setting('voiceProfile')??'default');
+  handle('nix:set-voice-preset',data=>{const v=z.string().min(1).max(100).parse(data);store.setSetting('voicePreset',v);});
+  handle('nix:voice-preset',()=>store.setting('voicePreset')??'default');
   handle('nix:integrations',()=>({...integrations,aiProviders:integrations.aiProviders.map(provider=>({...provider,apiKey:provider.apiKey?'__SAVED__':undefined})),homeAssistant:integrations.homeAssistant?{...integrations.homeAssistant,token:'__SAVED__'}:undefined,mcp:integrations.mcp.map(config=>config.transport==='http'?{...config,token:config.token?'__SAVED__':undefined}:{...config,env:Object.fromEntries(Object.keys(config.env).map(key=>[key,'__SAVED__']))})}));
   handle('nix:save-integrations',async data=>{
     if(agent.state().active)throw new Error('Finish the active task before changing integrations.');
@@ -172,6 +237,8 @@ else void app.whenReady().then(() => {
   });
   handle('nix:events', data => store.events(idSchema.parse(data)));
   handle('nix:workspace', () => store.setting('workspace') ?? '');
+  handle('nix:mp3-export', () => store.setting('mp3Export') !== 'false');
+  handle('nix:set-mp3-export', data => { store.setSetting('mp3Export', z.boolean().parse(data) ? 'true' : 'false'); });
   handle('nix:pick-workspace', async () => {
     if (agent.state().active) throw new Error('Stop the active task before changing its workspace.');
     const result = await dialog.showOpenDialog(window, { title: 'Select the task workspace', properties: ['openDirectory', 'createDirectory'] });
@@ -183,7 +250,7 @@ else void app.whenReady().then(() => {
     if (agent.state().active) throw new Error('Finish the active task before importing files.');
     if (input.workspace !== store.setting('workspace')) throw new Error('Select this workspace using the folder picker first.');
     const root = await realpath(input.workspace);
-    const result = await dialog.showOpenDialog(window, { title: 'Import files for NiX to analyze', properties: ['openFile', 'multiSelections'], filters: [{ name: 'Supported files', extensions: ['pdf','docx','pptx','txt','md','csv','json','log','inp','dat','yaml','yml','xml','png','jpg','jpeg','tiff','bmp'] }, { name: 'All files', extensions: ['*'] }] });
+    const result = await dialog.showOpenDialog(window, { title: 'Import files for NiX to analyze', properties: ['openFile', 'multiSelections'], filters: attachmentFilters });
     if (result.canceled) return [];
     const folder = join(root, '.nix-imports'); await mkdir(folder, { recursive: true });
     const imported = [];
@@ -200,6 +267,17 @@ else void app.whenReady().then(() => {
     }
     return imported;
   });
+  handle('nix:chat-attachments', async () => {
+    const result = await dialog.showOpenDialog(window, { title: 'Attach files to chat', properties: ['openFile', 'multiSelections'], filters: attachmentFilters });
+    if (result.canceled) return [];
+    const folder = join(app.getPath('userData'), 'chat-attachments'); await mkdir(folder, { recursive: true });
+    const attachments = [];
+    for (const source of result.filePaths.slice(0, 20)) {
+      const attachment = await processAttachment(source, folder);
+      if (attachment) attachments.push(attachment);
+    }
+    return z.array(processedAttachmentSchema).max(20).parse(attachments);
+  });
   handle('nix:run', async data => {
     if (runtime.activeId()) throw new Error('Finish the current chat reply first.');
     const input = runInputSchema.parse(data);
@@ -209,11 +287,11 @@ else void app.whenReady().then(() => {
   });
   handle('nix:reply-run', async data => {
     if (runtime.activeId()) throw new Error('Finish the current chat reply first.');
-    const input = z.object({ id: idSchema, content: runInputSchema.shape.goal }).strict().parse(data);
+    const input = z.object({ id: idSchema, content: runInputSchema.shape.goal, attachments: z.array(processedAttachmentSchema).max(20).optional() }).strict().parse(data);
     const previous = store.run(input.id);
     if (previous.mode !== 'mock' && previous.workspace !== store.setting('workspace')) throw new Error('Select the original workspace before replying.');
     if (!(await adapter.models()).includes(previous.model)) throw new Error('The original model must be installed or configured to continue this task.');
-    return agent.reply(input.id, input.content);
+    return agent.reply(input.id, input.content, input.attachments);
   });
   handle('nix:resume', async data => {
     if (runtime.activeId()) throw new Error('Finish the current chat reply first.');

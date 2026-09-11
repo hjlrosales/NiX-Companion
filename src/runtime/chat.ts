@@ -2,6 +2,7 @@ import type { ChatEvent, SendInput } from '../shared/contracts';
 import { sendSchema } from '../shared/contracts';
 import type { ModelAdapter, ModelMessage } from '../models/ollama';
 import { Store } from '../storage/database';
+import { attachmentContext } from '../shared/attachments';
 
 export function context(messages: ModelMessage[]): ModelMessage[] {
   const selected: ModelMessage[] = [];
@@ -11,7 +12,7 @@ export function context(messages: ModelMessage[]): ModelMessage[] {
     selected.unshift(message); size += message.content.length;
   }
   while (selected[0]?.role === 'assistant') selected.shift();
-  return [{ role: 'system', content: 'You are NiX, a local desktop chat assistant. You currently have no tools or access to files, terminal, devices, or the internet. Never claim to have performed actions. Older conversation messages may be omitted to fit context.' }, ...selected];
+  return [{ role: 'system', content: 'You are NiX, a local desktop chat assistant. You currently have no tools or access to files, terminal, devices, or the internet. Never claim to have performed actions. For device control (Bluetooth, WiFi, TVs, headphones, speakers, air conditioners, etc.), switch to Tasks mode where NiX can discover, connect to, and control real devices. Older conversation messages may be omitted to fit context.' }, ...selected];
 }
 export class ChatRuntime {
   private active: { id: string; controller: AbortController; work: Promise<void> } | null = null;
@@ -28,12 +29,13 @@ export class ChatRuntime {
       if (!(await this.adapter.models()).includes(input.model)) throw new Error('Select an installed local model. Refresh the model list.');
       if (controller.signal.aborted) throw new Error('Request cancelled.');
       const previous = this.store.messages(input.conversationId).filter(m => m.status === 'complete').map(m => ({ role: m.role, content: m.content }));
+      const userContent = `${input.content}${attachmentContext(input.attachments)}`;
       const reply = this.store.begin(input.conversationId, input.content, input.model);
       this.emit({ conversationId: input.conversationId, message: { ...reply } });
       slot.work = (async () => {
         const timeout = setTimeout(() => controller.abort(new Error('Reply timed out after three minutes.')), this.timeoutMs);
         try {
-          await this.adapter.chat(input.model, context([...previous, { role: 'user', content: input.content }]), controller.signal, text => {
+          await this.adapter.chat(input.model, context([...previous, { role: 'user', content: userContent }]), controller.signal, text => {
             if (controller.signal.aborted) throw controller.signal.reason;
             if (reply.content.length + text.length > 100000) throw new Error('Reply exceeded the output limit.');
             reply.content += text;

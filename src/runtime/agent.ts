@@ -3,6 +3,7 @@ import { Store } from '../storage/database';
 import { PermissionGate } from '../permissions/gate';
 import { Registry } from '../tools/registry';
 import { runInputSchema, type RunInput, type ParsedRunInput, type Run, type AgentModel, type AgentMessage } from '../shared/agent';
+import type { ProcessedAttachment } from '../shared/attachments';
 import { capabilityByTool, resolveSkillsForGoal, type CapabilityManifest } from '../shared/capabilities';
 
 export class AgentRuntime {
@@ -32,9 +33,12 @@ export class AgentRuntime {
     }).finally(() => { this.active = null; this.gate.clear(run.id); this.changed(); });
     return run.id;
   }
-  reply(id: string, content: string) {
+  reply(id: string, content: string, newAttachments?: ProcessedAttachment[]) {
     const previous = this.store.run(id);
-    const input = runInputSchema.parse({ goal: previous.goal, model: previous.model, mode: previous.mode, permissionMode: previous.permissionMode, workspace: previous.workspace, network: previous.network, teach: previous.teach, attachments: previous.attachments });
+    const mergedAttachments = newAttachments?.length
+      ? [...previous.attachments, ...newAttachments.map(a => ({ path: a.source, name: a.name, kind: a.processorType }))]
+      : previous.attachments;
+    const input = runInputSchema.parse({ goal: previous.goal, model: previous.model, mode: previous.mode, permissionMode: previous.permissionMode, workspace: previous.workspace, network: previous.network, teach: previous.teach, attachments: mergedAttachments });
     const message = runInputSchema.shape.goal.parse(content);
     return this.start(input, id, message);
   }

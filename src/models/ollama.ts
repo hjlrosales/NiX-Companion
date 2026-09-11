@@ -6,6 +6,7 @@ export interface ModelAdapter { models(): Promise<string[]>; chat(model: string,
 export const downloadableModels = ['qwen3:8b','qwen3:14b','qwen3-coder:30b','hf.co/DavidAU/OpenAi-GPT-oss-20b-HERETIC-uncensored-NEO-Imatrix-gguf:Q5_1'] as const;
 const chunkSchema = z.object({ error: z.string().optional(), done: z.boolean().optional(), message: z.object({ content: z.string().optional() }).optional() });
 export class Ollama implements ModelAdapter {
+  private pulling = new Set<string>();
   constructor(private base = 'http://127.0.0.1:11434') {
     const url = new URL(base);
     if (url.protocol !== 'http:' || !['127.0.0.1', 'localhost', '[::1]'].includes(url.hostname) || url.username || url.password || url.pathname !== '/' || url.search || url.hash) throw new Error('Ollama must use a local HTTP address.');
@@ -24,10 +25,16 @@ export class Ollama implements ModelAdapter {
   }
   async pull(model: string, signal: AbortSignal) {
     z.enum(downloadableModels).parse(model);
-    const response = await this.request('/api/pull', { method: 'POST', signal, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: model, stream: false }) });
-    const data = z.object({ error: z.string().optional() }).passthrough().parse(await response.json());
-    if (data.error) throw new Error(data.error);
-    return this.models();
+    if (this.pulling.has(model)) throw new Error(`${model} is already being downloaded. Wait for the current download to finish.`);
+    this.pulling.add(model);
+    try {
+      const response = await this.request('/api/pull', { method: 'POST', signal, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: model, stream: false }) });
+      const data = z.object({ error: z.string().optional() }).passthrough().parse(await response.json());
+      if (data.error) throw new Error(data.error);
+      return this.models();
+    } finally {
+      this.pulling.delete(model);
+    }
   }
   async turn(model: string, messages: AgentMessage[], tools: ToolSpec[], signal: AbortSignal) {
     const response = await this.request('/api/chat', { method: 'POST', signal, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ model, messages, tools, stream: false, think: false, options: { num_ctx: 8192, num_predict: 1500 } }) });

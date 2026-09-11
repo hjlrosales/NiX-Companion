@@ -21,5 +21,10 @@ export class VoiceService{
   }
   async setup(){await this.run({action:'setup'});return this.status();}
   async transcribe(bytes:Uint8Array){if(bytes.length<100||bytes.length>8_000_000)throw new Error('Recording must be between 100 bytes and 8 MB.');await mkdir(this.temp,{recursive:true});const input=join(this.temp,`${randomUUID()}.webm`);try{await writeFile(input,bytes);const result=await this.run({action:'transcribe',input});return String(result.text);}finally{await unlink(input).catch(()=>{});}}
-  async speak(text:string){await mkdir(this.temp,{recursive:true});const output=join(this.temp,`${randomUUID()}.wav`);try{await this.run({action:'speak',text,output});return `data:audio/wav;base64,${(await readFile(output)).toString('base64')}`;}finally{await unlink(output).catch(()=>{});}}
+  async speak(text:string,voiceProfile?:string,voicePreset?:string){await mkdir(this.temp,{recursive:true});const output=join(this.temp,`${randomUUID()}.mp3`);try{await this.run({action:'speak',text,output,voiceProfile:voiceProfile||undefined,voicePreset:voicePreset||undefined});return `data:audio/mp3;base64,${(await readFile(output)).toString('base64')}`;}finally{await unlink(output).catch(()=>{});}}
+  async speakToMp3(texts:string[],outputPath:string,voiceProfile?:string,voicePreset?:string){await mkdir(this.temp,{recursive:true});await this.run({action:'speak_mp3',texts,output:outputPath,voiceProfile:voiceProfile||undefined,voicePreset:voicePreset||undefined});return outputPath;}
+  async setupXtts(){return this.run({action:'setup_xtts'});}
+  async trainVoice(refAudioPath:string,voiceId:string,voiceName:string){return this.run({action:'train_voice',refAudio:refAudioPath,voiceId,voiceName});}
+  async listVoices(){return this.run({action:'list_voices'});}
+  async deleteVoice(voiceId:string){return this.run({action:'delete_voice',voiceId});}
 }
