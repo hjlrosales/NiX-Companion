@@ -139,7 +139,9 @@ import sys
 sys.path.insert(0,{site_packages})
 from TTS.api import TTS
 tts=TTS("tts_models/multilingual/multi-dataset/xtts_v2").to("cpu")
-tts.tts_to_file(text_file={_python_literal(text_file)},speaker_wav={_python_literal(ref_audio)},language="en",file_path={_python_literal(wav_out)})
+with open({_python_literal(text_file)},'r',encoding='utf-8') as f:
+    _text=f.read()
+tts.tts_to_file(text=_text,speaker_wav={_python_literal(ref_audio)},language="en",file_path={_python_literal(wav_out)})
 '''
 
 def main(request):
@@ -242,26 +244,65 @@ def _speak_coqui(root,text,output_path,voice_profile):
     py311=_find_python311()
     if not py311: raise ValueError('Python 3.11 not found for voice cloning.')
     ref_audio=str(Path(voice_profile)/'ref.wav')
-    import tempfile
+    import shutil,tempfile
     tmpdir=tempfile.mkdtemp()
-    wav_out=os.path.join(tmpdir,'output.wav')
-    text_file=os.path.join(tmpdir,'text.txt')
-    with open(text_file,'w',encoding='utf-8') as f: f.write(text[:3000])
     try:
-        cmd=[py311,'-c',_coqui_tts_command(text_file, ref_audio, wav_out)]
-        env={**os.environ,'COQUI_TOS_AGREED':'1'}
-        proc=subprocess.run(cmd,capture_output=True,text=True,timeout=300,env=env)
-        if proc.returncode!=0 or not Path(wav_out).exists():
-            raise ValueError(f'Coqui TTS failed: {proc.stderr[:500]}')
-        import shutil
-        shutil.move(wav_out,output_path)
+        # For long texts, split into sentences and concatenate
+        if len(text)>300:
+            chunks=_split_sentences(text,max_chars=300)
+            wav_files=[]
+            for i,chunk in enumerate(chunks):
+                wav_out=os.path.join(tmpdir,f'part_{i}.wav')
+                text_file=os.path.join(tmpdir,f'text_{i}.txt')
+                with open(text_file,'w',encoding='utf-8') as f: f.write(chunk)
+                cmd=[py311,'-c',_coqui_tts_command(text_file, ref_audio, wav_out)]
+                env={**os.environ,'COQUI_TOS_AGREED':'1'}
+                proc=subprocess.run(cmd,capture_output=True,text=True,timeout=120,env=env)
+                if proc.returncode!=0 or not Path(wav_out).exists():
+                    raise ValueError(f'Coqui TTS failed: {proc.stderr[:500]}')
+                wav_files.append(wav_out)
+            ffmpeg=_find_ffmpeg()
+            if ffmpeg and len(wav_files)>1:
+                concat_file=os.path.join(tmpdir,'concat.txt')
+                with open(concat_file,'w') as f:
+                    for wf in wav_files: f.write(f"file '{wf}'\n")
+                proc=subprocess.run([ffmpeg,'-y','-f','concat','-safe','0','-i',concat_file,'-ar','22050','-ac','1','-sample_fmt','s16',output_path],capture_output=True,text=True,timeout=60)
+                if proc.returncode!=0: raise ValueError(f'ffmpeg concat failed: {proc.stderr[:300]}')
+            else:
+                shutil.move(wav_files[0],output_path)
+        else:
+            wav_out=os.path.join(tmpdir,'output.wav')
+            text_file=os.path.join(tmpdir,'text.txt')
+            with open(text_file,'w',encoding='utf-8') as f: f.write(text[:3000])
+            cmd=[py311,'-c',_coqui_tts_command(text_file, ref_audio, wav_out)]
+            env={**os.environ,'COQUI_TOS_AGREED':'1'}
+            proc=subprocess.run(cmd,capture_output=True,text=True,timeout=120,env=env)
+            if proc.returncode!=0 or not Path(wav_out).exists():
+                raise ValueError(f'Coqui TTS failed: {proc.stderr[:500]}')
+            shutil.move(wav_out,output_path)
         return {'output':output_path}
     finally:
-        try: import shutil; shutil.rmtree(tmpdir)
+        try: shutil.rmtree(tmpdir)
         except: pass
 
+def _split_sentences(text, max_chars=200):
+    """Split text into chunks at sentence boundaries for faster TTS."""
+    import re
+    sentences = re.split(r'(?<=[.!?])\s+', text)
+    chunks = []
+    current = ''
+    for s in sentences:
+        if len(current) + len(s) + 1 > max_chars and current:
+            chunks.append(current.strip())
+            current = s
+        else:
+            current = (current + ' ' + s).strip() if current else s
+    if current.strip():
+        chunks.append(current.strip())
+    return chunks if chunks else [text[:max_chars]]
+
 def _speak_mp3_coqui(root,texts,output_path,voice_profile):
-    """Use Coqui TTS for multiple texts, convert to MP3."""
+    """Use Coqui TTS for multiple texts, convert to MP3. Splits long texts into sentences."""
     import shutil,tempfile
     ffmpeg=_find_ffmpeg()
     if not ffmpeg: raise ValueError('ffmpeg is not installed.')
@@ -271,16 +312,23 @@ def _speak_mp3_coqui(root,texts,output_path,voice_profile):
     tmpdir=tempfile.mkdtemp()
     wav_files=[]
     try:
-        for i,t in enumerate(texts):
+        # Split each text into smaller sentences for faster processing (~45s each on CPU)
+        all_chunks=[]
+        for t in texts:
             if not t: continue
+            if len(t)>300:
+                all_chunks.extend(_split_sentences(t, max_chars=300))
+            else:
+                all_chunks.append(t)
+        for i,chunk in enumerate(all_chunks):
             wav_out=os.path.join(tmpdir,f'part_{i}.wav')
             text_file=os.path.join(tmpdir,f'text_{i}.txt')
-            with open(text_file,'w',encoding='utf-8') as f: f.write(t[:3000])
+            with open(text_file,'w',encoding='utf-8') as f: f.write(chunk)
             cmd=[py311,'-c',_coqui_tts_command(text_file, ref_audio, wav_out)]
             env={**os.environ,'COQUI_TOS_AGREED':'1'}
-            proc=subprocess.run(cmd,capture_output=True,text=True,timeout=300,env=env)
+            proc=subprocess.run(cmd,capture_output=True,text=True,timeout=120,env=env)
             if proc.returncode!=0 or not Path(wav_out).exists():
-                raise ValueError(f'Coqui TTS failed: {proc.stderr[:500]}')
+                raise ValueError(f'Coqui TTS failed on chunk {i}: {proc.stderr[:500]}')
             wav_files.append(wav_out)
         if not wav_files: raise ValueError('No text provided.')
         concat_file=os.path.join(tmpdir,'concat.txt')
