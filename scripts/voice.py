@@ -175,11 +175,17 @@ def main(request):
         return {'text':' '.join(segment.text.strip() for segment in segments)[:6000]}
     if request['action']=='speak':
         voice_profile=request.get('voiceProfile')
+        voice_key=request.get('voicePreset','default')
         # Check if it's a Coqui voice profile (directory with ref.wav)
         if voice_profile and Path(voice_profile).is_dir() and (Path(voice_profile)/'ref.wav').exists():
-            return _speak_coqui(root,request['text'],request['output'],voice_profile)
-        # Use edge-tts
-        voice_key=request.get('voicePreset','default')
+            if _find_python311():
+                try:
+                    return _speak_coqui(root,request['text'],request['output'],voice_profile)
+                except Exception as e:
+                    sys.stderr.write(f'Coqui TTS failed, falling back to edge-tts: {e}\n')
+            else:
+                sys.stderr.write('Python 3.11 not found for voice cloning. Using default voice.\n')
+        # Use edge-tts (fallback or default)
         _edge_speak_sync(request['text'],voice_key,request['output'])
         return {'output':request['output']}
     if request['action']=='speak_mp3':
@@ -188,7 +194,13 @@ def main(request):
         import shutil,tempfile
         # Check if it's a Coqui voice profile
         if voice_profile and Path(voice_profile).is_dir() and (Path(voice_profile)/'ref.wav').exists():
-            return _speak_mp3_coqui(root,texts,request['output'],voice_profile)
+            if _find_python311():
+                try:
+                    return _speak_mp3_coqui(root,texts,request['output'],voice_profile)
+                except Exception as e:
+                    sys.stderr.write(f'Coqui TTS failed, falling back to edge-tts: {e}\n')
+            else:
+                sys.stderr.write('Python 3.11 not found for voice cloning. Using default voice.\n')
         # Use edge-tts for each text, concatenate with ffmpeg
         voice_key=request.get('voicePreset','default')
         ffmpeg=_find_ffmpeg()
