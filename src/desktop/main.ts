@@ -42,7 +42,8 @@ else void app.whenReady().then(() => {
   let window: BrowserWindow;
   const processes = new Processes();
   const browsers = new BrowserSessions();
-  const voice = new VoiceService(app.getAppPath(),app.isPackaged?join(app.getPath('userData'),'voice-models'):join(app.getAppPath(),'.nix-models'),join(app.getPath('userData'),'voice-temp'));
+  const projectRoot=app.isPackaged?app.getAppPath():join(__dirname,'..','..');
+  const voice = new VoiceService(projectRoot,app.isPackaged?join(app.getPath('userData'),'voice-models'):join(projectRoot,'.nix-models'),join(app.getPath('userData'),'voice-temp'));
   let microphoneUntil=0;
   const commandCheck=(file:string,args:string[],timeout=5000)=>new Promise<string>((resolve,reject)=>execFile(file,args,{windowsHide:true,timeout,maxBuffer:200000},(error,stdout,stderr)=>error?reject(new Error(stderr||error.message)):resolve(stdout.trim())));
   const setupStatus=async()=>{
