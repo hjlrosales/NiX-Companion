@@ -1,6 +1,27 @@
-import json,sys,os,urllib.request,asyncio
+import json,sys,os,urllib.request,asyncio,subprocess
 from pathlib import Path
 os.environ['ONNX_PROVIDER']='CPUExecutionProvider'
+
+# ── Auto-install dependencies on first run ──────────────────────────────
+def _ensure_package(pkg_name, import_name=None):
+    """Try importing a package; if missing, pip install it."""
+    imp = import_name or pkg_name
+    try:
+        __import__(imp)
+    except ImportError:
+        subprocess.run(
+            [sys.executable, '-m', 'pip', 'install', pkg_name, '--quiet', '--disable-pip-version-check'],
+            capture_output=True, timeout=120
+        )
+        # Verify install succeeded
+        try:
+            __import__(imp)
+        except ImportError:
+            raise ImportError(
+                f"Failed to install {pkg_name}. Install manually: {sys.executable} -m pip install {pkg_name}"
+            )
+
+_ensure_package('edge-tts', 'edge_tts')
 
 # Edge-TTS voice presets (high quality neural voices)
 VOICE_PRESETS={
@@ -27,8 +48,8 @@ VOICE_PRESETS={
 
 def _convert_to_wav(input_path,output_path):
     """Convert any audio format to WAV using ffmpeg."""
-    import shutil,subprocess
-    ffmpeg=shutil.which('ffmpeg')
+    import shutil
+    ffmpeg=_find_ffmpeg()
     if ffmpeg:
         proc=subprocess.run([ffmpeg,'-y','-i',input_path,'-ar','22050','-ac','1','-sample_fmt','s16',output_path],capture_output=True,text=True,timeout=30)
         if proc.returncode!=0: raise ValueError(f'ffmpeg conversion failed: {proc.stderr[:300]}')
@@ -63,7 +84,7 @@ def _find_python311():
     candidates=[
         r'C:\Program Files\Python311\python.exe',
         r'C:\Python311\python.exe',
-        r'C:\Users\{}\AppData\Local\Programs\Python\Python311\python.exe'.format(os.environ.get('USERNAME','')),
+        os.path.join(os.environ.get('LOCALAPPDATA',''), 'Programs', 'Python', 'Python311', 'python.exe'),
         shutil.which('python3.11'),
         shutil.which('python3.11.exe'),
     ]
@@ -77,7 +98,16 @@ def _find_ffmpeg():
     import shutil
     candidates=[
         shutil.which('ffmpeg'),
-        r'C:\Users\{}\AppData\Local\Microsoft\WinGet\Packages\Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe\ffmpeg-9.0.1-full_build\bin\ffmpeg.exe'.format(os.environ.get('USERNAME','')),
+    ]
+    # Also search common install locations
+    username=os.environ.get('USERNAME','')
+    if username:
+        candidates+=[
+            rf'C:\Users\{username}\AppData\Local\Microsoft\WinGet\Links\ffmpeg.exe',
+            rf'C:\Users\{username}\AppData\Local\Microsoft\WinGet\Packages\Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe\ffmpeg-9.0.1-full_build\bin\ffmpeg.exe',
+            rf'C:\Users\{username}\AppData\Local\Microsoft\WinGet\Packages\Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe\ffmpeg-7.1.1-full_build\bin\ffmpeg.exe',
+        ]
+    candidates+=[
         r'C:\ffmpeg\bin\ffmpeg.exe',
         r'C:\Program Files\ffmpeg\bin\ffmpeg.exe',
     ]
@@ -86,9 +116,36 @@ def _find_ffmpeg():
             return c
     return None
 
+def _python_literal(value):
+    """Return a Python-safe string literal for paths and other values."""
+    return repr(str(value))
+
+def _coqui_site_packages():
+    """Find Python 3.11's site-packages for Coqui TTS."""
+    py311=_find_python311()
+    if py311:
+        py_dir=Path(py311).parent
+        candidate=py_dir / 'Lib' / 'site-packages'
+        if candidate.exists():
+            return str(candidate)
+    # Fall back to current Python's site-packages
+    return str(Path(sys.prefix) / 'Lib' / 'site-packages')
+
+def _coqui_tts_command(text_file, ref_audio, wav_out):
+    """Build a Coqui XTTS command with correctly escaped paths."""
+    site_packages = _python_literal(_coqui_site_packages())
+    return f'''
+import sys
+sys.path.insert(0,{site_packages})
+from TTS.api import TTS
+tts=TTS("tts_models/multilingual/multi-dataset/xtts_v2").to("cpu")
+tts.tts_to_file(text_file={_python_literal(text_file)},speaker_wav={_python_literal(ref_audio)},language="en",file_path={_python_literal(wav_out)})
+'''
+
 def main(request):
     root=Path(request['models']);root.mkdir(parents=True,exist_ok=True)
     if request['action']=='setup':
+        _ensure_package('huggingface_hub')
         from huggingface_hub import snapshot_download
         snapshot_download('Systran/faster-whisper-small',local_dir=str(root/'whisper-small'),allow_patterns=['config.json','model.bin','tokenizer.json','vocabulary.txt','preprocessor_config.json'])
         for name in ['kokoro-v1.0.onnx','voices-v1.0.bin']:
@@ -100,11 +157,12 @@ def main(request):
     if request['action']=='setup_xtts':
         py311=_find_python311()
         if py311:
-            import subprocess
             subprocess.run([py311,'-m','pip','install','TTS','--quiet'],capture_output=True,timeout=300)
             return {'ready':True,'pythonPath':py311}
         return {'ready':False,'error':'Python 3.11 not found. Install Python 3.11 for voice cloning support: https://www.python.org/downloads/release/python-3119/'}
     if request['action']=='transcribe':
+        _ensure_package('faster-whisper')
+        _ensure_package('av')
         from faster_whisper import WhisperModel
         import av
         with av.open(request['input']) as audio:
@@ -125,7 +183,7 @@ def main(request):
     if request['action']=='speak_mp3':
         voice_profile=request.get('voiceProfile')
         texts=request.get('texts',[]) or [request.get('text','')]
-        import subprocess,shutil,tempfile
+        import shutil,tempfile
         # Check if it's a Coqui voice profile
         if voice_profile and Path(voice_profile).is_dir() and (Path(voice_profile)/'ref.wav').exists():
             return _speak_mp3_coqui(root,texts,request['output'],voice_profile)
@@ -184,19 +242,13 @@ def _speak_coqui(root,text,output_path,voice_profile):
     py311=_find_python311()
     if not py311: raise ValueError('Python 3.11 not found for voice cloning.')
     ref_audio=str(Path(voice_profile)/'ref.wav')
-    import subprocess,tempfile
+    import tempfile
     tmpdir=tempfile.mkdtemp()
     wav_out=os.path.join(tmpdir,'output.wav')
     text_file=os.path.join(tmpdir,'text.txt')
     with open(text_file,'w',encoding='utf-8') as f: f.write(text[:3000])
     try:
-        cmd=[py311,'-c',f'''
-import sys
-sys.path.insert(0,"{sys.prefix}/Lib/site-packages")
-from TTS.api import TTS
-tts=TTS("tts_models/multilingual/multi-dataset/xtts_v2").to("cpu")
-tts.tts_to_file(text_file="{text_file}",speaker_wav="{ref_audio}",language="en",file_path="{wav_out}")
-''']
+        cmd=[py311,'-c',_coqui_tts_command(text_file, ref_audio, wav_out)]
         env={**os.environ,'COQUI_TOS_AGREED':'1'}
         proc=subprocess.run(cmd,capture_output=True,text=True,timeout=300,env=env)
         if proc.returncode!=0 or not Path(wav_out).exists():
@@ -210,7 +262,7 @@ tts.tts_to_file(text_file="{text_file}",speaker_wav="{ref_audio}",language="en",
 
 def _speak_mp3_coqui(root,texts,output_path,voice_profile):
     """Use Coqui TTS for multiple texts, convert to MP3."""
-    import subprocess,shutil,tempfile
+    import shutil,tempfile
     ffmpeg=_find_ffmpeg()
     if not ffmpeg: raise ValueError('ffmpeg is not installed.')
     py311=_find_python311()
@@ -224,13 +276,7 @@ def _speak_mp3_coqui(root,texts,output_path,voice_profile):
             wav_out=os.path.join(tmpdir,f'part_{i}.wav')
             text_file=os.path.join(tmpdir,f'text_{i}.txt')
             with open(text_file,'w',encoding='utf-8') as f: f.write(t[:3000])
-            cmd=[py311,'-c',f'''
-import sys
-sys.path.insert(0,"{sys.prefix}/Lib/site-packages")
-from TTS.api import TTS
-tts=TTS("tts_models/multilingual/multi-dataset/xtts_v2").to("cpu")
-tts.tts_to_file(text_file="{text_file}",speaker_wav="{ref_audio}",language="en",file_path="{wav_out}")
-''']
+            cmd=[py311,'-c',_coqui_tts_command(text_file, ref_audio, wav_out)]
             env={**os.environ,'COQUI_TOS_AGREED':'1'}
             proc=subprocess.run(cmd,capture_output=True,text=True,timeout=300,env=env)
             if proc.returncode!=0 or not Path(wav_out).exists():
@@ -260,14 +306,13 @@ def _train_voice(root,request):
     ref_wav=str(voice_dir/'ref.wav')
     _convert_to_wav(ref_input,ref_wav)
     # Verify it works by doing a quick TTS test
-    import subprocess
-    test_cmd=[py311,'-c',f'''
+    test_cmd=[py311, '-c', f'''
 import sys
-sys.path.insert(0,"{sys.prefix}/Lib/site-packages")
+sys.path.insert(0,{_python_literal(_coqui_site_packages())})
 from TTS.api import TTS
 tts=TTS("tts_models/multilingual/multi-dataset/xtts_v2").to("cpu")
-tts.tts_to_file(text="Test.",speaker_wav="{ref_wav}",language="en",file_path="{ref_wav}.test.wav")
-import os; os.remove("{ref_wav}.test.wav")
+tts.tts_to_file(text="Test.",speaker_wav={_python_literal(ref_wav)},language="en",file_path={_python_literal(f"{ref_wav}.test.wav")})
+import os; os.remove({ _python_literal(f"{ref_wav}.test.wav") })
 print("OK")
 ''']
     env={**os.environ,'COQUI_TOS_AGREED':'1'}
